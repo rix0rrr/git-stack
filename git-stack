@@ -1,0 +1,277 @@
+#!/bin/bash
+set -e
+
+# set -u is not safe because Bash < 4.4 will barf on use of empty arrays :(
+
+######################################################################
+
+help() {
+    cat <<EOF
+📚 git-stack: work on multiple branches simultaneously
+
+A stack is a set of branches (with corresponding PRs on GitHub), that are
+merged together locally so you can continue to work as if the PRs had been
+merged already.
+
+    git stack
+        If on a stack, show info.
+        If not on a stack, show README
+
+    git stack --create [--name ...] [BRANCH...]
+        Create a new stack from the given branches and switch to it
+        warns if this is going to replace an existing stack
+
+    git stack --add BRANCH
+        Add a new branch to the stack and refresh it.
+
+    git stack --remove BRANCH
+        Remove a branch from the stack and refresh it.
+
+    git stack --patch BRANCH
+    git stack --append BRANCH
+        Commit the current changes to the given branch. --patch must update
+        an old branch. --append must create a new branch.
+
+    git stack --refresh
+        Refresh the stack
+
+    git stack --rebase BRANCH
+        Rebase and refresh the stack on top of a new base commit.
+
+    git stack --push
+        Push all branches in the stack
+EOF
+}
+
+command=""
+name=""
+verbose=false
+
+set_command() {
+    if [[ ! -z "$command" ]]; then
+        echo "Cannot combine --$command and --$1." >&2
+        exit 1
+    fi
+    command="$1"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        # Commands
+        -c|--create)
+            set_command create
+            ;;
+        -a|--add)
+            set_command add
+            ;;
+        --remove)
+            set_command remove
+            ;;
+        -p|--patch)
+            set_command patch
+            ;;
+        -A|--append)
+            set_command append
+            ;;
+        -r|--refresh)
+            set_command refresh
+            ;;
+        -R|--rebase)
+            set_command rebase
+            ;;
+        -p|--push)
+            set_command push
+            ;;
+
+        # Options
+        -n|--name)
+            name="$2"
+            shift
+            ;;
+        -v|--verbose)
+            verbose=true
+            ;;
+        -h|--help)
+            help
+            exit 0
+            ;;
+        -*)
+            help
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
+######################################################################
+
+quiet="--quiet"
+if $verbose; then
+    quiet=""
+fi
+
+git_dir="$(git rev-parse --git-dir)"
+stacks_dir="${git_dir}/stacks"
+current_git_branch="$(git rev-parse --abbrev-ref HEAD)"
+
+declare -a stack_branches
+stack_base=""
+stack_name=""
+
+
+is_stack() {
+    if [[ -f "${stacks_dir}/${current_git_branch}" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+load_stack() {
+    source "${stacks_dir}/${stack_name}"
+}
+
+save_stack() {
+    mkdir -p "$stacks_dir"
+    f="${stacks_dir}/${stack_name}"
+
+    echo "stack_branches=()" > "$f"
+    echo "stack_base=\"${stack_base}\"" >> "$f"
+    for branch in "${stack_branches[@]}"; do
+        echo "stack_branches+=(\"${branch}\")" >> "$f"
+    done
+}
+
+refresh_stack() {
+    echo "📚 Base:  ${stack_base}"
+    git reset --hard ${quiet} "${stack_base}"
+    for branch in "${stack_branches[@]}"; do
+        echo "📚 Stack: $branch"
+        git merge --no-edit --rerere-autoupdate ${quiet} "$branch"
+    done
+}
+
+is_branch() {
+    if git rev-parse --verify "$1" > /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+validate_exists() {
+    if ! is_branch "$1"; then
+        echo "No such branch: $1" >&2
+        exit 1
+    fi
+}
+
+if is_stack "${current_git_branch}"; then
+    stack_name=${current_git_branch}
+    load_stack
+fi
+
+######################################################################
+
+if [[ "$command" == "" ]]; then
+    if ! $is_stack; then
+        echo "${current_git_branch}: not a stack!"
+        echo ""
+        help
+        exit 0
+    fi
+    echo "Stack:"
+    echo "    ${stack_name}"
+    echo "Base:"
+    echo "    ${stack_base}"
+    echo "Branches:"
+    for branch in "${stack_branches[@]}"; do
+        echo "    $branch"
+    done
+fi
+
+case "$command" in
+    create)
+        git config --global rerere.enabled true
+
+        stack_name="${name:-STACK}"
+        stack_base="${current_git_branch}"
+        for branch in "$@"; do
+            validate_exists "$branch"
+            stack_branches+=("${branch}")
+        done
+
+        save_stack
+        git checkout -b "$stack_name"
+        refresh_stack
+        ;;
+    add)
+        for branch in "$@"; do
+            validate_exists "$branch"
+            stack_branches+=("${branch}")
+        done
+
+        save_stack
+        refresh_stack
+        ;;
+    remove)
+        for delete in "$@"; do
+            for i in "${!stack_branches[@]}"; do
+                if [[ "${stack_branches[i]}" = "$delete" ]]; then
+                    unset 'stack_branches[i]'
+                fi
+            done
+        done
+
+        save_stack
+        refresh_stack
+        ;;
+    patch)
+        validate_exists "$1"
+        # The branch must also be in this stack
+        found=false
+        for branch in "${stack_branches[@]}"; do
+            if [[ "$branch" == "$1" ]]; then
+                found=true
+            fi
+        done
+        if ! $found; then
+            echo "Not a branch in this stack: $1" >&2
+            exit 1
+        fi
+
+        echo "Not implemented yet: patch" >&2
+        exit 1
+        ;;
+    append)
+        if is_branch "$1"; then
+            echo "Already an existing branch: $1" >&2
+            exit 1
+        fi
+        echo "Not implemented yet: append" >&2
+        exit 1
+        ;;
+    refresh)
+        refresh_stack
+        ;;
+    rebase)
+        if [[ "$1" == "" ]]; then
+            echo "git-stack rebase: requires an argument" >&2
+            exit 1
+        fi
+        stack_base="$1"
+        validate_exists "$stack_base"
+        save_stack
+        refresh_stack
+        ;;
+    push)
+        origin="origin"
+        for branch in "${stack_branches[@]}"; do
+            echo "📚 Pushing: $branch"
+            git push $quiet "$origin" "${branch}"
+        done
+        ;;
+esac

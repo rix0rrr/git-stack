@@ -17,28 +17,43 @@ merged already.
         If on a stack, show info.
         If not on a stack, show README
 
-    git stack --create [--name ...] [BRANCH...]
-        Create a new stack from the given branches and switch to it
-        warns if this is going to replace an existing stack
+    git stack -N|--new [--name ...] [BRANCH...]
+        Create a new stack targeting the current branch as base, adding the
+        given branches initially as patches. Warns if this is going to replace
+        an existing stack
 
-    git stack --add BRANCH
+    git stack -c|--commit BRANCH
+        Commit the currently staged changes to the given branch, either
+        adding onto an existing BRANCH or creating a new one off of the current
+        stack's base.
+
+    git stack -x|--extract SRC DST
+        Take the currently staged changes, apply them to SRC, and apply them
+        in reverse to DST. This moves changes from SRC to DST. DST can be
+        either an existing or new branch.
+
+        Obtain these changes by (for example) running 'git checkout -p 1234abcd~'
+        on the commit that introduced them.
+
+    git stack -d|--delete [--name ...]
+        Delete a given stack.
+
+    git stack -A|--add BRANCH
         Add a new branch to the stack and refresh it.
 
     git stack --remove BRANCH
         Remove a branch from the stack and refresh it.
 
-    git stack --patch BRANCH
-    git stack --append BRANCH
-        Commit the current changes to the given branch. --patch must update
-        an old branch. --append must create a new branch.
-
-    git stack --refresh
+    git stack -r|--refresh
         Refresh the stack
 
-    git stack --rebase BRANCH
+    git stack -R|--rebase BRANCH
         Rebase and refresh the stack on top of a new base commit.
 
-    git stack --push
+    git stack -o|--reorder [--name ...]
+        Edit the stack configuration in \$EDITOR ($EDITOR), then refresh.
+
+    git stack -P|--push
         Push all branches in the stack
 EOF
 }
@@ -48,7 +63,7 @@ name=""
 verbose=false
 
 set_command() {
-    if [[ ! -z "$command" ]]; then
+    if [[ -n "$command" ]]; then
         echo "Cannot combine --$command and --$1." >&2
         exit 1
     fi
@@ -58,20 +73,23 @@ set_command() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         # Commands
-        -c|--create)
-            set_command create
+        -N|--new)
+            set_command new
             ;;
-        -a|--add)
+        -d|--delete)
+            set_command delete
+            ;;
+        -A|--add)
             set_command add
             ;;
         --remove)
             set_command remove
             ;;
-        -p|--patch)
-            set_command patch
+        -c|--commit)
+            set_command commit
             ;;
-        -A|--append)
-            set_command append
+        -x|--extract)
+            set_command extract
             ;;
         -r|--refresh)
             set_command refresh
@@ -79,8 +97,11 @@ while [[ $# -gt 0 ]]; do
         -R|--rebase)
             set_command rebase
             ;;
-        -p|--push)
+        -P|--push)
             set_command push
+            ;;
+        -o|--reorder)
+            set_command reorder
             ;;
 
         # Options
@@ -121,9 +142,12 @@ declare -a stack_branches
 stack_base=""
 stack_name=""
 
+stack_file() {
+    echo "${stacks_dir}/${stack_name}"
+}
 
 is_stack() {
-    if [[ -f "${stacks_dir}/${current_git_branch}" ]]; then
+    if [[ -f "${stacks_dir}/$1" ]]; then
         return 0
     else
         return 1
@@ -131,12 +155,13 @@ is_stack() {
 }
 
 load_stack() {
-    source "${stacks_dir}/${stack_name}"
+    # shellcheck source=/dev/null
+    source "$(stack_file)"
 }
 
 save_stack() {
     mkdir -p "$stacks_dir"
-    f="${stacks_dir}/${stack_name}"
+    f="$(stack_file)"
 
     echo "stack_branches=()" > "$f"
     echo "stack_base=\"${stack_base}\"" >> "$f"
@@ -169,6 +194,27 @@ validate_exists() {
     fi
 }
 
+ensure_branch() {
+    if is_branch "$1"; then
+        # An existing branch, must be in this stack already
+        found=false
+        for branch in "${stack_branches[@]}"; do
+            if [[ "$branch" == "$1" ]]; then
+                found=true
+            fi
+        done
+        if ! $found; then
+            echo "Existing branch but not in this stack: $1 (add using git stack --add first)" >&2
+            exit 1
+        fi
+    else
+        # Not an existing branch, create one and add it to the stack
+        git branch "$1" "${stack_base}"
+        stack_branches+=("$1")
+        save_stack
+    fi
+}
+
 if is_stack "${current_git_branch}"; then
     stack_name=${current_git_branch}
     load_stack
@@ -177,7 +223,7 @@ fi
 ######################################################################
 
 if [[ "$command" == "" ]]; then
-    if ! $is_stack; then
+    if [[ "$stack_name" == "" ]]; then
         echo "${current_git_branch}: not a stack!"
         echo ""
         help
@@ -194,12 +240,16 @@ if [[ "$command" == "" ]]; then
 fi
 
 case "$command" in
-    create)
+    new)
         git config --global rerere.enabled true
 
         stack_name="${name:-STACK}"
         stack_base="${current_git_branch}"
         for branch in "$@"; do
+            if [[ "${branch}" == "${stack_base}" ]]; then
+                echo "Stack branch (${branch}) cannot be the same as the base (${stack_base}). Switch to 'main' or 'master' first." >&2
+                exit 1
+            fi
             validate_exists "$branch"
             stack_branches+=("${branch}")
         done
@@ -207,6 +257,21 @@ case "$command" in
         save_stack
         git checkout -b "$stack_name"
         refresh_stack
+        ;;
+    delete)
+        stack_name="${name:-${stack_name:-STACK}}"
+        if ! is_stack "$stack_name"; then
+            echo "No such stack: $stack_name" >&2
+            exit 1
+        fi
+
+        load_stack
+        if [[ "${current_git_branch}" == "${stack_name}" ]]; then
+            git checkout "${stack_base}"
+        fi
+
+        git branch -D "${stack_name}"
+        rm "${stacks_dir}/${stack_name}"
         ;;
     add)
         for branch in "$@"; do
@@ -229,30 +294,79 @@ case "$command" in
         save_stack
         refresh_stack
         ;;
-    patch)
-        validate_exists "$1"
-        # The branch must also be in this stack
-        found=false
-        for branch in "${stack_branches[@]}"; do
-            if [[ "$branch" == "$1" ]]; then
-                found=true
-            fi
-        done
-        if ! $found; then
-            echo "Not a branch in this stack: $1" >&2
+    commit)
+        branch="$1"
+        if [[ -z "$branch" ]]; then
+            echo "Supply a BRANCH" >&2
             exit 1
         fi
+        ensure_branch "$branch"
 
-        echo "Not implemented yet: patch" >&2
-        exit 1
+        # Process (since we cannot stash only unstaged changes)
+        # . Commit staged changes to a temporary branch
+        # . Stash what's left
+        #   | . Switch to (or create) target branch
+        #   | . Cherry-pick temporary branch, amending the commit message
+        #   | . Switch back to source branch
+        # . Pop stash
+        echo "📚 Committing index to temporary branch"
+        git checkout -B stack_tmp
+
+        did_commit="true"
+        git commit -m "Add changes to $branch" || { did_commit="false"; }
+
+        if $did_commit; then
+            echo "📚 Stashing other changes"
+            should_pop="true"
+            git stash push || { should_pop="false"; }
+
+            echo "📚 Replaying index"
+            git checkout "$branch"
+            success="true"
+            git cherry-pick stack_tmp --edit || { success="false"; }
+
+            echo "📚 Back to where we were"
+            git checkout "$current_git_branch"
+
+            if ! $success; then
+                # Cherry-pick our index back here without committing
+                git cherry-pick stack_tmp --no-commit
+            fi
+
+            if $should_pop; then
+                # Pop our unstaged changes back
+                git stash pop
+            fi
+
+            # Do a refresh as well
+            refresh_stack
+        else
+            git checkout "$current_git_branch"
+            git branch -D stack_tmp
+        fi
         ;;
-    append)
-        if is_branch "$1"; then
-            echo "Already an existing branch: $1" >&2
+    extract)
+        src="$1"
+        dst="$2"
+        if [[ -z "$src" || -z "$dst" ]]; then
+            echo "Supply a SRC and DST " >&2
             exit 1
         fi
-        echo "Not implemented yet: append" >&2
-        exit 1
+        validate_exists "$src"
+        ensure_branch "$dst"
+
+        git checkout "$src"
+        git commit -m "Moving changes to ${dst}"
+        commit=$(git rev-parse HEAD)
+
+        git checkout "$dst"
+        # Apply the commit in reverse
+        git show "$commit" | git apply --index -R
+        git commit
+
+        git checkout "$current_git_branch"
+
+        refresh_stack
         ;;
     refresh)
         refresh_stack
@@ -274,4 +388,12 @@ case "$command" in
             git push $quiet "$origin" "${branch}"
         done
         ;;
+    reorder)
+        sf="$(stack_file)"
+        cp "${sf}" "${sf}.tmp"
+        ${EDITOR:-vim} "${sf}.tmp" && {
+            mv "${sf}.tmp" "${sf}"
+            $0 --refresh
+        }
+
 esac

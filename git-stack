@@ -18,7 +18,7 @@ merged already.
         If not on a stack, show README
 
     git stack -N|--new [--name ...] [BRANCH...]
-        Create a new stack targeting the current branch as base, adding the
+        Create a new stack targeting the current commit as base, adding the
         given branches initially as patches. Warns if this is going to replace
         an existing stack
 
@@ -32,8 +32,10 @@ merged already.
         in reverse to DST. This moves changes from SRC to DST. DST can be
         either an existing or new branch.
 
-        Obtain these changes by (for example) running 'git checkout -p 1234abcd~'
-        on the commit that introduced them.
+        Obtain these changes by (for example) running one of these commands:
+
+            git checkout -p 1234abcd~
+            git checkout STACK-base path/to/my/file
 
     git stack -d|--delete [--name ...]
         Delete a given stack.
@@ -244,15 +246,18 @@ case "$command" in
         git config --global rerere.enabled true
 
         stack_name="${name:-STACK}"
-        stack_base="${current_git_branch}"
         for branch in "$@"; do
-            if [[ "${branch}" == "${stack_base}" ]]; then
-                echo "Stack branch (${branch}) cannot be the same as the base (${stack_base}). Switch to 'main' or 'master' first." >&2
+            if [[ "${branch}" == "${current_git_branch}" ]]; then
+                echo "Stack branch (${branch}) cannot be the same as the base (${current_git_branch}). Switch to 'main' or 'master' first." >&2
                 exit 1
             fi
             validate_exists "$branch"
             stack_branches+=("${branch}")
         done
+
+        # Make a marker branch for the stack base, so that it won't move
+        git checkout -B "${stack_name}-base"
+        stack_base="${stack_name}-base"
 
         save_stack
         git checkout -b "$stack_name"
@@ -272,6 +277,11 @@ case "$command" in
 
         git branch -D "${stack_name}"
         rm "${stacks_dir}/${stack_name}"
+
+        # Remove the special base branch if it exists
+        if is_branch "${stack_name}-base"; then
+            git branch -D "${stack_name}-base"
+        fi
         ;;
     add)
         for branch in "$@"; do

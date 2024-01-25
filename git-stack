@@ -255,12 +255,18 @@ case "$command" in
             stack_branches+=("${branch}")
         done
 
+        if is_stack "$stack_name"; then
+            echo "Stack already exists: ${stack_name}. Press [ENTER] to confirm or Ctrl-C to abort." >&2
+            read
+        fi
+
+
         # Make a marker branch for the stack base, so that it won't move
         git checkout -B "${stack_name}-base"
         stack_base="${stack_name}-base"
 
         save_stack
-        git checkout -b "$stack_name"
+        git checkout -B "$stack_name"
         refresh_stack
         ;;
     delete)
